@@ -2,13 +2,16 @@ import sys
 import os
 import json
 import base64
+import tempfile
+import shutil
 from io import BytesIO
 from pathlib import Path
 
 from PySide6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, 
                              QWidget, QPushButton, QLineEdit, QTextEdit, QLabel, 
                              QFileDialog, QMessageBox, QStatusBar, QGroupBox, QFormLayout,
-                             QFrame, QSizePolicy, QSpacerItem, QScrollArea)
+                             QFrame, QSizePolicy, QSpacerItem, QScrollArea, QProgressBar,
+                             QComboBox, QSplitter, QInputDialog)
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QPropertyAnimation, QEasingCurve, QRect
 from PySide6.QtGui import QPixmap, QFont, QPalette, QColor, QIcon, QDragEnterEvent, QDropEvent
 import qtawesome as qta
@@ -52,15 +55,20 @@ class ImageWorker(QThread):
     image_generated = Signal(object)
     image_recognized = Signal(str)
     error_occurred = Signal(str)
+    progress_updated = Signal(int)
     
-    def __init__(self, api_key, operation, data):
+    def __init__(self, api_key, operation, data, model=None, recognition_prompt=None):
         super().__init__()
         self.api_key = api_key
-        self.operation = operation  # 'generate' or 'recognize'
+        self.operation = operation
         self.data = data
+        self.model = model
+        self.recognition_prompt = recognition_prompt
     
     def run(self):
         try:
+            self.progress_updated.emit(10)
+            
             if not GEMINI_AVAILABLE:
                 if self.operation == 'generate':
                     self.generate_mock_image()
@@ -68,6 +76,7 @@ class ImageWorker(QThread):
                     self.error_occurred.emit("Image recognition requires Gemini API")
                 return
             
+            self.progress_updated.emit(30)
             client = genai.Client(api_key=self.api_key)
             
             if self.operation == 'generate':
@@ -80,17 +89,22 @@ class ImageWorker(QThread):
     
     def generate_image(self, client):
         """Generate image from prompt"""
+        self.progress_updated.emit(50)
+        
         response = client.models.generate_content(
-            model="gemini-2.0-flash-preview-image-generation",
+            model=self.model or "gemini-2.0-flash-preview-image-generation",
             contents=self.data,
             config=types.GenerateContentConfig(
                 response_modalities=['TEXT', 'IMAGE']
             )
         )
         
+        self.progress_updated.emit(80)
+        
         for part in response.candidates[0].content.parts:
             if part.inline_data is not None:
                 image = Image.open(BytesIO(part.inline_data.data))
+                self.progress_updated.emit(100)
                 self.image_generated.emit(image)
                 return
         
@@ -98,6 +112,8 @@ class ImageWorker(QThread):
     
     def recognize_image(self, client):
         """Recognize and describe image"""
+        self.progress_updated.emit(50)
+        
         with open(self.data, 'rb') as f:
             image_bytes = f.read()
         
@@ -108,16 +124,19 @@ class ImageWorker(QThread):
                     data=image_bytes,
                     mime_type='image/jpeg' if self.data.lower().endswith('.jpg') or self.data.lower().endswith('.jpeg') else 'image/png',
                 ),
-                'Describe this image in detail for AI image generation purposes. Focus on visual elements, style, composition, colors, and mood.'
+                self.recognition_prompt or "Describe this image in detail for AI image generation purposes."
             ]
         )
         
+        self.progress_updated.emit(100)
         self.image_recognized.emit(response.text)
     
     def generate_mock_image(self):
         """Generate a placeholder image for testing"""
         try:
             from PIL import Image, ImageDraw, ImageFont
+            
+            self.progress_updated.emit(50)
             
             img = Image.new('RGB', (400, 400), color='lightblue')
             draw = ImageDraw.Draw(img)
@@ -128,12 +147,15 @@ class ImageWorker(QThread):
             except:
                 font = ImageFont.load_default()
             
+            self.progress_updated.emit(80)
+            
             lines = text.split('\n')
             y_offset = 40
             for line in lines:
                 draw.text((15, y_offset), line, fill='darkblue', font=font)
                 y_offset += 25
             
+            self.progress_updated.emit(100)
             self.image_generated.emit(img)
             
         except Exception as e:
@@ -146,6 +168,20 @@ class GeminiImageGenerator(QMainWindow):
         self.last_prompt = ""
         self.config_file = "config.json"
         self.dark_theme = True
+        self.recognition_prompt = "Describe this image in detail for AI image generation purposes. Focus on visual elements, style, composition, colors, and mood."
+        self.temp_dir = tempfile.mkdtemp(prefix="gemini_gen_")
+        
+        # Define available models
+        self.models = {
+            "Gemini 2.0 Flash": "gemini-2.0-flash",
+            "Gemini 2.0 Flash (Image Gen)": "gemini-2.0-flash-preview-image-generation",
+            "Gemini 2.0 Flash-Lite": "gemini-2.0-flash-lite",
+            "Gemini 1.5 Flash": "gemini-1.5-flash",
+            "Gemini 1.5 Flash-8B": "gemini-1.5-flash-8b",
+            "Gemini 1.5 Pro": "gemini-1.5-pro",
+            "Imagen 4": "imagen-4.0-generate-preview-06-06",
+            "Imagen 4 Ultra": "imagen-4.0-ultra-generate-preview-06-06"
+        }
         
         self.init_ui()
         self.load_config()
@@ -155,10 +191,28 @@ class GeminiImageGenerator(QMainWindow):
         self.status_timer.setSingleShot(True)
         self.status_timer.timeout.connect(self.clear_status)
     
+    def setup_windows_taskbar(self):
+        """Setup Windows taskbar icon and app ID"""
+        try:
+            import ctypes
+            app_id = 'mudri.gemini.imagegen.1.0'
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+        except:
+            pass
+    
+    def closeEvent(self, event):
+        """Clean up temp folder on close"""
+        try:
+            if os.path.exists(self.temp_dir):
+                shutil.rmtree(self.temp_dir)
+        except:
+            pass
+        event.accept()
+    
     def init_ui(self):
-        """Initialize the compact user interface"""
+        """Initialize the enhanced compact user interface"""
         self.setWindowTitle("Gemini Image Generator")
-        self.setFixedSize(480, 720)
+        self.setFixedSize(500, 800)
         self.setWindowIcon(qta.icon('fa5s.magic', color='#6366f1'))
         
         central_widget = QWidget()
@@ -167,7 +221,6 @@ class GeminiImageGenerator(QMainWindow):
         main_layout.setSpacing(2)
         main_layout.setContentsMargins(2, 2, 2, 2)
         
-        # Compact header
         header_layout = QHBoxLayout()
         header_layout.setSpacing(2)
         
@@ -177,6 +230,14 @@ class GeminiImageGenerator(QMainWindow):
         
         header_layout.addStretch()
         
+        self.reset_btn = QPushButton()
+        self.reset_btn.setObjectName("smallButton")
+        self.reset_btn.setFixedSize(30, 30)
+        self.reset_btn.setIcon(qta.icon('fa5s.trash'))
+        self.reset_btn.clicked.connect(self.reset_all)
+        self.reset_btn.setToolTip("Reset all content")
+        header_layout.addWidget(self.reset_btn)
+        
         self.theme_btn = QPushButton()
         self.theme_btn.setObjectName("themeButton")
         self.theme_btn.setFixedSize(30, 30)
@@ -185,7 +246,6 @@ class GeminiImageGenerator(QMainWindow):
         
         main_layout.addLayout(header_layout)
         
-        # API Key (compact)
         api_layout = QHBoxLayout()
         api_layout.setSpacing(2)
         api_label = QLabel("API:")
@@ -201,7 +261,22 @@ class GeminiImageGenerator(QMainWindow):
         
         main_layout.addLayout(api_layout)
         
-        # Context section (drag & drop)
+        model_layout = QHBoxLayout()
+        model_layout.setSpacing(2)
+        model_label = QLabel("Model:")
+        model_label.setFixedWidth(40)
+        model_layout.addWidget(model_label)
+        
+        self.model_combo = QComboBox()
+        self.model_combo.setObjectName("compactCombo")
+        for display_name in self.models.keys():
+            self.model_combo.addItem(display_name)
+        self.model_combo.setCurrentText("Gemini 2.0 Flash (Image Gen)")
+        self.model_combo.currentTextChanged.connect(self.save_config)
+        model_layout.addWidget(self.model_combo)
+        
+        main_layout.addLayout(model_layout)
+        
         context_frame = QFrame()
         context_frame.setObjectName("compactFrame")
         context_layout = QVBoxLayout(context_frame)
@@ -220,6 +295,12 @@ class GeminiImageGenerator(QMainWindow):
         self.identify_btn.clicked.connect(self.browse_image)
         context_header.addWidget(self.identify_btn)
         
+        self.prompt_btn = QPushButton("Prompt")
+        self.prompt_btn.setObjectName("smallButton")
+        self.prompt_btn.setFixedSize(40, 20)
+        self.prompt_btn.clicked.connect(self.edit_recognition_prompt)
+        context_header.addWidget(self.prompt_btn)
+        
         context_layout.addLayout(context_header)
         
         self.drop_area = DropLabel("📁 Drop image here or browse")
@@ -236,7 +317,6 @@ class GeminiImageGenerator(QMainWindow):
         
         main_layout.addWidget(context_frame)
         
-        # Prompt section
         prompt_frame = QFrame()
         prompt_frame.setObjectName("compactFrame")
         prompt_layout = QVBoxLayout(prompt_frame)
@@ -253,24 +333,26 @@ class GeminiImageGenerator(QMainWindow):
         self.prompt_input.setPlaceholderText("Describe your image...")
         prompt_layout.addWidget(self.prompt_input)
         
-        # Action buttons
         button_layout = QHBoxLayout()
         button_layout.setSpacing(2)
         
         self.use_context_btn = QPushButton("Use Context")
         self.use_context_btn.setObjectName("smallButton")
         self.use_context_btn.setFixedHeight(25)
+        self.use_context_btn.setIcon(qta.icon('fa5s.copy'))
         self.use_context_btn.clicked.connect(self.use_context)
         self.use_context_btn.setEnabled(False)
         
         self.generate_btn = QPushButton("Generate")
         self.generate_btn.setObjectName("primaryButton")
         self.generate_btn.setFixedHeight(25)
+        self.generate_btn.setIcon(qta.icon('fa5s.magic'))
         self.generate_btn.clicked.connect(self.generate_image)
         
         self.regenerate_btn = QPushButton("Regen")
         self.regenerate_btn.setObjectName("secondaryButton")
         self.regenerate_btn.setFixedHeight(25)
+        self.regenerate_btn.setIcon(qta.icon('fa5s.redo'))
         self.regenerate_btn.clicked.connect(self.regenerate_image)
         self.regenerate_btn.setEnabled(False)
         
@@ -281,7 +363,12 @@ class GeminiImageGenerator(QMainWindow):
         prompt_layout.addLayout(button_layout)
         main_layout.addWidget(prompt_frame)
         
-        # Image display
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setObjectName("modernProgress")
+        self.progress_bar.setFixedHeight(4)
+        self.progress_bar.setVisible(False)
+        main_layout.addWidget(self.progress_bar)
+        
         image_frame = QFrame()
         image_frame.setObjectName("compactFrame")
         image_layout = QVBoxLayout(image_frame)
@@ -297,6 +384,7 @@ class GeminiImageGenerator(QMainWindow):
         self.save_btn = QPushButton("Save")
         self.save_btn.setObjectName("smallButton")
         self.save_btn.setFixedSize(40, 20)
+        self.save_btn.setIcon(qta.icon('fa5s.save'))
         self.save_btn.clicked.connect(self.save_image)
         self.save_btn.setEnabled(False)
         image_header.addWidget(self.save_btn)
@@ -305,13 +393,12 @@ class GeminiImageGenerator(QMainWindow):
         
         self.image_label = DropLabel("✨ Generated image")
         self.image_label.setObjectName("imageDisplay")
-        self.image_label.setFixedSize(468, 300)
+        self.image_label.setFixedSize(488, 300)
         self.image_label.file_dropped.connect(self.handle_dropped_file)
         
         image_layout.addWidget(self.image_label)
         main_layout.addWidget(image_frame)
         
-        # Status bar
         self.status_bar = QStatusBar()
         self.status_bar.setObjectName("compactStatusBar")
         self.setStatusBar(self.status_bar)
@@ -320,7 +407,7 @@ class GeminiImageGenerator(QMainWindow):
             self.status_bar.showMessage("⚠️ Mock mode", 3000)
     
     def get_light_theme_style(self):
-        """Compact light theme"""
+        """Enhanced light theme with progress bar and combo styling"""
         return """
             QMainWindow { background-color: #f8fafc; color: #1e293b; }
             #titleLabel { font-size: 14px; font-weight: bold; color: #6366f1; }
@@ -331,6 +418,13 @@ class GeminiImageGenerator(QMainWindow):
                 padding: 4px; font-size: 11px; color: #1f2937;
             }
             #compactInput:focus, #compactTextEdit:focus { border-color: #6366f1; background-color: white; }
+            #compactCombo { 
+                background-color: #f9fafb; border: 1px solid #e5e7eb; border-radius: 3px; 
+                padding: 4px; font-size: 11px; color: #1f2937; min-height: 20px;
+            }
+            #compactCombo:focus { border-color: #6366f1; background-color: white; }
+            #compactCombo::drop-down { border: none; }
+            #compactCombo::down-arrow { image: url(none); }
             #primaryButton { 
                 background-color: #6366f1; color: white; border: none; border-radius: 3px; 
                 padding: 4px 8px; font-size: 11px; font-weight: 600;
@@ -355,11 +449,17 @@ class GeminiImageGenerator(QMainWindow):
                 background-color: #f9fafb; border: 1px solid #d1d5db; border-radius: 4px; 
                 color: #6b7280; font-size: 12px;
             }
+            #modernProgress { 
+                background-color: #e5e7eb; border: none; border-radius: 2px;
+            }
+            #modernProgress::chunk { 
+                background-color: #6366f1; border-radius: 2px;
+            }
             #compactStatusBar { background-color: #f8fafc; color: #6b7280; font-size: 10px; }
         """
     
     def get_dark_theme_style(self):
-        """Compact dark theme"""
+        """Enhanced dark theme with progress bar and combo styling"""
         return """
             QMainWindow { background-color: #0f172a; color: #e2e8f0; }
             #titleLabel { font-size: 14px; font-weight: bold; color: #8b5cf6; }
@@ -370,6 +470,13 @@ class GeminiImageGenerator(QMainWindow):
                 padding: 4px; font-size: 11px; color: #f1f5f9;
             }
             #compactInput:focus, #compactTextEdit:focus { border-color: #8b5cf6; background-color: #475569; }
+            #compactCombo { 
+                background-color: #334155; border: 1px solid #475569; border-radius: 3px; 
+                padding: 4px; font-size: 11px; color: #f1f5f9; min-height: 20px;
+            }
+            #compactCombo:focus { border-color: #8b5cf6; background-color: #475569; }
+            #compactCombo::drop-down { border: none; }
+            #compactCombo::down-arrow { image: url(none); }
             #primaryButton { 
                 background-color: #8b5cf6; color: white; border: none; border-radius: 3px; 
                 padding: 4px 8px; font-size: 11px; font-weight: 600;
@@ -394,6 +501,12 @@ class GeminiImageGenerator(QMainWindow):
                 background-color: #334155; border: 1px solid #64748b; border-radius: 4px; 
                 color: #94a3b8; font-size: 12px;
             }
+            #modernProgress { 
+                background-color: #475569; border: none; border-radius: 2px;
+            }
+            #modernProgress::chunk { 
+                background-color: #8b5cf6; border-radius: 2px;
+            }
             #compactStatusBar { background-color: #0f172a; color: #94a3b8; font-size: 10px; }
         """
     
@@ -412,6 +525,29 @@ class GeminiImageGenerator(QMainWindow):
         self.apply_theme()
         self.save_config()
     
+    def reset_all(self):
+        """Reset all content and clear temp folder"""
+        self.context_output.clear()
+        self.prompt_input.clear()
+        self.drop_area.setText("📁 Drop image here")
+        self.image_label.setText("✨ Generated image")
+        self.image_label.setPixmap(QPixmap())
+        
+        self.current_image = None
+        self.last_prompt = ""
+        
+        self.use_context_btn.setEnabled(False)
+        self.regenerate_btn.setEnabled(False)
+        self.save_btn.setEnabled(False)
+        
+        try:
+            for file in os.listdir(self.temp_dir):
+                os.remove(os.path.join(self.temp_dir, file))
+        except:
+            pass
+        
+        self.status_bar.showMessage("🗑️ Content cleared", 2000)
+    
     def browse_image(self):
         """Browse for image file"""
         file_path, _ = QFileDialog.getOpenFileName(
@@ -421,23 +557,47 @@ class GeminiImageGenerator(QMainWindow):
         if file_path:
             self.handle_dropped_file(file_path)
     
+    def edit_recognition_prompt(self):
+        """Edit the image recognition prompt"""
+        text, ok = QInputDialog.getMultiLineText(
+            self, 
+            "Edit Recognition Prompt",
+            "Enter the prompt for image analysis:",
+            self.recognition_prompt
+        )
+        
+        if ok and text.strip():
+            self.recognition_prompt = text.strip()
+            self.save_config()
+            self.status_bar.showMessage("🔧 Prompt updated", 2000)
+    
     def handle_dropped_file(self, file_path):
         """Handle dropped or browsed image file"""
         try:
             self.drop_area.setText(f"📁 {os.path.basename(file_path)}")
+            
+            pixmap = QPixmap(file_path)
+            if not pixmap.isNull():
+                if self.sender() == self.image_label:
+                    full_scaled = pixmap.scaled(self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    self.image_label.setPixmap(full_scaled)
+            
             self.status_bar.showMessage("🔍 Analyzing image...")
+            self.progress_bar.setVisible(True)
+            self.progress_bar.setValue(0)
             
-            # Show preview if dropped on image display
-            if self.sender() == self.image_label:
-                pixmap = QPixmap(file_path)
-                if not pixmap.isNull():
-                    scaled_pixmap = pixmap.scaled(self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                    self.image_label.setPixmap(scaled_pixmap)
+            self.generate_btn.setEnabled(False)
+            self.regenerate_btn.setEnabled(False)
             
-            # Start image recognition
-            self.worker = ImageWorker(self.api_key_input.text().strip(), 'recognize', file_path)
+            self.worker = ImageWorker(
+                self.api_key_input.text().strip(), 
+                'recognize', 
+                file_path,
+                recognition_prompt=self.recognition_prompt
+            )
             self.worker.image_recognized.connect(self.on_image_recognized)
             self.worker.error_occurred.connect(self.on_error)
+            self.worker.progress_updated.connect(self.progress_bar.setValue)
             self.worker.start()
             
         except Exception as e:
@@ -447,6 +607,11 @@ class GeminiImageGenerator(QMainWindow):
         """Handle successful image recognition"""
         self.context_output.setText(description)
         self.use_context_btn.setEnabled(True)
+        self.generate_btn.setEnabled(True)
+        if self.last_prompt:
+            self.regenerate_btn.setEnabled(True)
+        
+        self.progress_bar.setVisible(False)
         self.status_bar.showMessage("✅ Image analyzed", 2000)
     
     def use_context(self):
@@ -499,17 +664,30 @@ class GeminiImageGenerator(QMainWindow):
         self.regenerate_btn.setEnabled(False)
         self.save_btn.setEnabled(False)
         
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
         self.status_bar.showMessage("🎨 Generating...")
         
-        self.worker = ImageWorker(self.api_key_input.text().strip(), 'generate', self.last_prompt)
+        selected_model = self.models.get(self.model_combo.currentText())
+        
+        self.worker = ImageWorker(
+            self.api_key_input.text().strip(), 
+            'generate', 
+            self.last_prompt,
+            selected_model
+        )
         self.worker.image_generated.connect(self.on_image_generated)
         self.worker.error_occurred.connect(self.on_error)
+        self.worker.progress_updated.connect(self.progress_bar.setValue)
         self.worker.start()
     
     def on_image_generated(self, image):
         """Handle generated image"""
         try:
             self.current_image = image
+            
+            temp_path = os.path.join(self.temp_dir, f"generated_{len(os.listdir(self.temp_dir))}.png")
+            image.save(temp_path)
             
             img_byte_arr = BytesIO()
             image.save(img_byte_arr, format='PNG')
@@ -525,6 +703,7 @@ class GeminiImageGenerator(QMainWindow):
             self.regenerate_btn.setEnabled(True)
             self.save_btn.setEnabled(True)
             
+            self.progress_bar.setVisible(False)
             self.status_bar.showMessage("✅ Generated!", 2000)
             
         except Exception as e:
@@ -538,10 +717,11 @@ class GeminiImageGenerator(QMainWindow):
         if self.last_prompt:
             self.regenerate_btn.setEnabled(True)
         
+        self.progress_bar.setVisible(False)
         self.status_bar.showMessage("❌ Failed", 2000)
     
     def save_image(self):
-        """Save current image"""
+        """Save current image to user-selected location"""
         if not self.current_image:
             self.show_error("No image to save")
             return
@@ -567,6 +747,12 @@ class GeminiImageGenerator(QMainWindow):
                     config = json.load(f)
                     self.api_key_input.setText(config.get('api_key', ''))
                     self.dark_theme = config.get('dark_theme', True)
+                    self.recognition_prompt = config.get('recognition_prompt', 
+                        'Describe this image in detail for AI image generation purposes. Focus on visual elements, style, composition, colors, and mood.')
+                    
+                    selected_model = config.get('selected_model', 'Gemini 2.0 Flash (Image Gen)')
+                    if selected_model in self.models:
+                        self.model_combo.setCurrentText(selected_model)
         except Exception as e:
             self.show_error(f"Config load failed: {str(e)}")
     
@@ -575,7 +761,9 @@ class GeminiImageGenerator(QMainWindow):
         try:
             config = {
                 'api_key': self.api_key_input.text(),
-                'dark_theme': self.dark_theme
+                'dark_theme': self.dark_theme,
+                'recognition_prompt': self.recognition_prompt,
+                'selected_model': self.model_combo.currentText()
             }
             with open(self.config_file, 'w') as f:
                 json.dump(config, f)
@@ -594,6 +782,7 @@ def main():
     """Main entry point"""
     app = QApplication(sys.argv)
     app.setApplicationName("Gemini Image Generator")
+    app.setApplicationDisplayName("Gemini Image Generator")
     window = GeminiImageGenerator()
     window.show()
     sys.exit(app.exec())
